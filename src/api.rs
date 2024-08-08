@@ -45,7 +45,7 @@ use windows::{
     },
     Win32::System::Threading::{CreateEventA, WaitForSingleObject},
 };
-use windows_core::{implement, IUnknown, Interface, PROPVARIANT};
+use windows_core::{implement, IUnknown, Interface, HSTRING, PCWSTR, PROPVARIANT};
 
 use crate::{make_channelmasks, AudioSessionEvents, EventCallbacks, WaveFormat};
 
@@ -211,6 +211,18 @@ impl fmt::Display for DeviceState {
             DeviceState::Unplugged => write!(f, "Unplugged"),
         }
     }
+}
+
+pub fn get_device_by_id(device_id: &str, direction: &Direction) -> WasapiRes<Device> {
+    let hstring = HSTRING::from(device_id);
+    let pwstrid = PCWSTR::from_raw(hstring.as_wide().as_ptr());
+    let enumerator: IMMDeviceEnumerator =
+        unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
+    let device = unsafe { enumerator.GetDevice(pwstrid)? };
+    Ok(Device {
+        device,
+        direction: *direction,
+    })
 }
 
 /// Get the default playback or capture device for the console role
