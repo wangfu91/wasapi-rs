@@ -9,11 +9,11 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::{error, fmt, ptr, slice};
 use widestring::U16CString;
 use windows::Win32::Media::Audio::{
-    ActivateAudioInterfaceAsync, IActivateAudioInterfaceAsyncOperation,
-    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
-    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
-    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    ActivateAudioInterfaceAsync, IAcousticEchoCancellationControl,
+    IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
+    IActivateAudioInterfaceCompletionHandler_Impl, AUDIOCLIENT_ACTIVATION_PARAMS,
+    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
 };
 use windows::Win32::System::Variant::VT_BLOB;
@@ -926,6 +926,14 @@ impl AudioClient {
     pub fn get_sharemode(&self) -> Option<ShareMode> {
         self.sharemode
     }
+
+    pub fn get_aec_control(&self) -> WasapiRes<AcousticEchoCancellationControl> {
+        let control = unsafe {
+            self.client
+                .GetService::<IAcousticEchoCancellationControl>()?
+        };
+        Ok(AcousticEchoCancellationControl { control })
+    }
 }
 
 /// Struct wrapping an [IAudioSessionControl](https://docs.microsoft.com/en-us/windows/win32/api/audiopolicy/nn-audiopolicy-iaudiosessioncontrol).
@@ -961,6 +969,23 @@ impl AudioSessionControl {
                 Err(WasapiError::new(&format!("Failed to register notifications, {}", err)).into())
             }
         }
+    }
+}
+
+/// Struct wrapping an [AcousticEchoCancellationControl](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iacousticechocancellationcontrol).
+pub struct AcousticEchoCancellationControl {
+    control: IAcousticEchoCancellationControl,
+}
+
+impl AcousticEchoCancellationControl {
+    /// Sets the audio render endpoint that should be used as the reference stream for acoustic echo cancellation (AEC).
+    pub fn set_echo_cancellation_render_endpoint(&self, endpoint_id: String) -> WasapiRes<()> {
+        let endpoint_id = HSTRING::from(endpoint_id);
+        unsafe {
+            self.control
+                .SetEchoCancellationRenderEndpoint(&endpoint_id)?
+        };
+        Ok(())
     }
 }
 
