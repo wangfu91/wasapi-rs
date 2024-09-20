@@ -9,11 +9,12 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::{error, fmt, ptr, slice};
 use widestring::U16CString;
 use windows::Win32::Media::Audio::{
-    ActivateAudioInterfaceAsync, IAcousticEchoCancellationControl,
+    ActivateAudioInterfaceAsync, AudioClientProperties, IAcousticEchoCancellationControl,
     IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
-    IActivateAudioInterfaceCompletionHandler_Impl, AUDIOCLIENT_ACTIVATION_PARAMS,
-    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
-    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    IActivateAudioInterfaceCompletionHandler_Impl, IAudioClient2, IAudioEffectsManager,
+    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
+    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
+    AUDIO_EFFECT, AUDIO_STREAM_CATEGORY, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
 };
 use windows::Win32::System::Variant::VT_BLOB;
@@ -934,6 +935,24 @@ impl AudioClient {
         };
         Ok(AcousticEchoCancellationControl { control })
     }
+
+    pub fn get_audio_effects_manager(&self) -> WasapiRes<AudioEffectsManager> {
+        let manager = unsafe { self.client.GetService::<IAudioEffectsManager>()? };
+        Ok(AudioEffectsManager { manager })
+    }
+
+    pub fn set_audio_stream_category(&self, category: AUDIO_STREAM_CATEGORY) -> WasapiRes<()> {
+        let audio_client_2 = self.client.cast::<IAudioClient2>()?;
+
+        let audio_client_property = AudioClientProperties {
+            cbSize: size_of::<AudioClientProperties>() as u32,
+            eCategory: category,
+            ..Default::default()
+        };
+
+        unsafe { audio_client_2.SetClientProperties(&audio_client_property as *const _)? };
+        Ok(())
+    }
 }
 
 /// Struct wrapping an [IAudioSessionControl](https://docs.microsoft.com/en-us/windows/win32/api/audiopolicy/nn-audiopolicy-iaudiosessioncontrol).
@@ -968,6 +987,33 @@ impl AudioSessionControl {
             Err(err) => {
                 Err(WasapiError::new(&format!("Failed to register notifications, {}", err)).into())
             }
+        }
+    }
+}
+
+// Struct wrapping an [IAudioEffectsManager](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iaudioeffectsmanager).
+pub struct AudioEffectsManager {
+    manager: IAudioEffectsManager,
+}
+
+impl AudioEffectsManager {
+    pub fn get_audio_effects(&self) -> WasapiRes<Option<Vec<AUDIO_EFFECT>>> {
+        let mut audio_effects: *mut AUDIO_EFFECT = std::ptr::null_mut();
+        let mut num_effects: u32 = 0;
+
+        unsafe {
+            self.manager
+                .GetAudioEffects(&mut audio_effects, &mut num_effects)?;
+        }
+
+        // Assuming you want to return the first effect or handle it in some way
+        if num_effects > 0 {
+            let effects_slice =
+                unsafe { std::slice::from_raw_parts(audio_effects, num_effects as usize) };
+            let effects_vec = effects_slice.to_vec();
+            Ok(Some(effects_vec))
+        } else {
+            Ok(None)
         }
     }
 }
