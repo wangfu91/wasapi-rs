@@ -304,7 +304,7 @@ impl fmt::Display for DeviceState {
 
 pub fn get_device_by_id(device_id: &str, direction: &Direction) -> WasapiRes<Device> {
     let hstring = HSTRING::from(device_id);
-    let pwstrid = PCWSTR::from_raw(hstring.as_wide().as_ptr());
+    let pwstrid = PCWSTR::from_raw(hstring.as_ptr());
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
     let device = unsafe { enumerator.GetDevice(pwstrid)? };
