@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::error::{self};
+use std::ffi::OsStr;
 use std::fs::File;
 use std::io::prelude::*;
 use std::sync::mpsc;
@@ -28,20 +29,19 @@ fn capture_loop(
     let include_tree = true;
 
     let mut audio_client = AudioClient::new_application_loopback_client(process_id, include_tree)?;
-    audio_client.initialize_client(
-        &desired_format,
-        0,
-        &Direction::Capture,
-        &ShareMode::Shared,
+    let mode = StreamMode::EventsShared {
         autoconvert,
-    )?;
+        buffer_duration_hns: 0,
+    };
+    audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
 
     debug!("initialized capture");
     let h_event = audio_client.set_get_eventhandle().unwrap();
 
     let capture_client = audio_client.get_audiocaptureclient().unwrap();
 
-    let mut sample_queue: VecDeque<u8> = VecDeque::new(); // just eat the reallocation because querying the buffer size gives massive values.
+    // just eat the reallocation because querying the buffer size gives massive values.
+    let mut sample_queue: VecDeque<u8> = VecDeque::new();
 
     audio_client.start_stream().unwrap();
 
@@ -56,7 +56,7 @@ fn capture_loop(
         }
         trace!("capturing");
 
-        let new_frames = capture_client.get_next_nbr_frames()?.unwrap_or(0);
+        let new_frames = capture_client.get_next_packet_size()?.unwrap_or(0);
         let additional = (new_frames as usize * blockalign as usize)
             .saturating_sub(sample_queue.capacity() - sample_queue.len());
         sample_queue.reserve(additional);
@@ -85,12 +85,13 @@ fn main() -> Res<()> {
             .build(),
     );
 
-    let refreshes = RefreshKind::new().with_processes(ProcessRefreshKind::everything());
+    let refreshes = RefreshKind::nothing().with_processes(ProcessRefreshKind::everything());
     let system = System::new_with_specifics(refreshes);
-    let process_ids = system.processes_by_name("firefox.exe");
+    let process_ids = system.processes_by_name(OsStr::new("firefox.exe"));
     let mut process_id = 0;
     for process in process_ids {
-        // Note: When capturing audio windows allows you to capture an app's entire process tree, however you must ensure you use the parent as the target process ID
+        // Note: When capturing audio windows allows you to capture an app's entire process tree,
+        // however you must ensure you use the parent as the target process ID
         process_id = process.parent().unwrap_or(process.pid()).as_u32();
     }
 

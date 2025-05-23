@@ -1,4 +1,5 @@
 use std::f64::consts::PI;
+use std::{thread, time};
 use wasapi::*;
 
 #[macro_use]
@@ -103,7 +104,7 @@ fn main() {
     debug!("default period {}, min period {}", def_time, min_time);
 
     debug!("Initializing device with convert={}", needs_convert);
-    let mode = StreamMode::EventsShared {
+    let mode = StreamMode::PollingShared {
         autoconvert: needs_convert,
         buffer_duration_hns: def_time,
     };
@@ -113,9 +114,12 @@ fn main() {
         .unwrap();
     debug!("initialized playback");
 
-    let h_event = audio_client.set_get_eventhandle().unwrap();
-
     let render_client = audio_client.get_audiorenderclient().unwrap();
+
+    let buffer_frames = audio_client.get_buffer_size().unwrap();
+    let sleep_period = time::Duration::from_millis(
+        500 * buffer_frames as u64 / desired_format.get_samplespersec() as u64,
+    );
 
     audio_client.start_stream().unwrap();
     loop {
@@ -137,10 +141,6 @@ fn main() {
             .write_to_device(buffer_frame_count as usize, &data, None)
             .unwrap();
         trace!("write ok");
-        if h_event.wait_for_event(1000).is_err() {
-            error!("error, stopping playback");
-            audio_client.stop_stream().unwrap();
-            break;
-        }
+        thread::sleep(sleep_period);
     }
 }

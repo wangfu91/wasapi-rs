@@ -4,21 +4,23 @@ use std::collections::VecDeque;
 use std::mem::{size_of, ManuallyDrop};
 use std::ops::Deref;
 use std::pin::Pin;
-use std::rc::Weak;
 use std::sync::{Arc, Condvar, Mutex};
-use std::{error, fmt, ptr, slice};
+use std::{fmt, ptr, slice};
 use widestring::U16CString;
+use windows::Win32::Foundation::{E_NOINTERFACE, PROPERTYKEY};
 use windows::Win32::Media::Audio::{
-    ActivateAudioInterfaceAsync, AudioClientProperties, IAcousticEchoCancellationControl,
-    IActivateAudioInterfaceAsyncOperation, IActivateAudioInterfaceCompletionHandler,
-    IActivateAudioInterfaceCompletionHandler_Impl, IAudioClient2, IAudioEffectsManager,
-    AUDIOCLIENT_ACTIVATION_PARAMS, AUDIOCLIENT_ACTIVATION_PARAMS_0,
-    AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK, AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS,
-    AUDIO_EFFECT, AUDIO_STREAM_CATEGORY, PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
+    ActivateAudioInterfaceAsync, AudioClientProperties, EDataFlow, ERole,
+    IAcousticEchoCancellationControl, IActivateAudioInterfaceAsyncOperation,
+    IActivateAudioInterfaceCompletionHandler, IActivateAudioInterfaceCompletionHandler_Impl,
+    IAudioClient2, IAudioEffectsManager, IMMEndpoint, AUDIOCLIENT_ACTIVATION_PARAMS,
+    AUDIOCLIENT_ACTIVATION_PARAMS_0, AUDIOCLIENT_ACTIVATION_TYPE_PROCESS_LOOPBACK,
+    AUDIOCLIENT_PROCESS_LOOPBACK_PARAMS, AUDIO_EFFECT, AUDIO_STREAM_CATEGORY,
+    PROCESS_LOOPBACK_MODE_EXCLUDE_TARGET_PROCESS_TREE,
     PROCESS_LOOPBACK_MODE_INCLUDE_TARGET_PROCESS_TREE, VIRTUAL_AUDIO_DEVICE_PROCESS_LOOPBACK,
 };
+use windows::Win32::Media::KernelStreaming::AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION;
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::Variant::VT_BLOB;
-use windows::Win32::UI::Shell::PropertiesSystem::PROPERTYKEY;
 use windows::{
     core::{HRESULT, PCSTR},
     Win32::Devices::FunctionDiscovery::{
@@ -38,45 +40,21 @@ use windows::{
         WAVEFORMATEXTENSIBLE,
     },
     Win32::Media::KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
-    Win32::System::Com::StructuredStorage::PropVariantToStringAlloc,
-    Win32::System::Com::STGM_READ,
+    Win32::System::Com::StructuredStorage::{
+        PropVariantToStringAlloc, PROPVARIANT, PROPVARIANT_0, PROPVARIANT_0_0, PROPVARIANT_0_0_0,
+    },
     Win32::System::Com::{
         CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_APARTMENTTHREADED,
         COINIT_MULTITHREADED,
     },
+    Win32::System::Com::{BLOB, STGM_READ},
     Win32::System::Threading::{CreateEventA, WaitForSingleObject},
 };
-use windows_core::{implement, IUnknown, Interface, HSTRING, PCWSTR, PROPVARIANT};
+use windows_core::{implement, IUnknown, Interface, Ref, HSTRING, PCWSTR};
 
-use crate::{make_channelmasks, AudioSessionEvents, EventCallbacks, WaveFormat};
+use crate::{make_channelmasks, AudioSessionEvents, EventCallbacks, WasapiError, WaveFormat};
 
-pub(crate) type WasapiRes<T> = Result<T, Box<dyn error::Error>>;
-
-/// Error returned by the Wasapi crate.
-#[derive(Debug)]
-pub struct WasapiError {
-    desc: String,
-}
-
-impl fmt::Display for WasapiError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.desc)
-    }
-}
-
-impl error::Error for WasapiError {
-    fn description(&self) -> &str {
-        &self.desc
-    }
-}
-
-impl WasapiError {
-    pub fn new(desc: &str) -> Self {
-        WasapiError {
-            desc: desc.to_owned(),
-        }
-    }
-}
+pub(crate) type WasapiRes<T> = Result<T, WasapiError>;
 
 /// Initializes COM for use by the calling thread for the multi-threaded apartment (MTA).
 pub fn initialize_mta() -> HRESULT {
@@ -109,6 +87,40 @@ impl fmt::Display for Direction {
     }
 }
 
+impl TryFrom<&EDataFlow> for Direction {
+    type Error = WasapiError;
+
+    fn try_from(value: &EDataFlow) -> Result<Self, Self::Error> {
+        match value {
+            EDataFlow(0) => Ok(Self::Render),
+            EDataFlow(1) => Ok(Self::Capture),
+            // EDataFlow(2) => All/Both,
+            x => Err(WasapiError::IllegalDeviceDirection(x.0)),
+        }
+    }
+}
+impl TryFrom<EDataFlow> for Direction {
+    type Error = WasapiError;
+
+    fn try_from(value: EDataFlow) -> Result<Self, Self::Error> {
+        Self::try_from(&value)
+    }
+}
+
+impl From<&Direction> for EDataFlow {
+    fn from(value: &Direction) -> Self {
+        match value {
+            Direction::Capture => eCapture,
+            Direction::Render => eRender,
+        }
+    }
+}
+impl From<Direction> for EDataFlow {
+    fn from(value: Direction) -> Self {
+        Self::from(&value)
+    }
+}
+
 /// Wrapper for [ERole](https://learn.microsoft.com/en-us/windows/win32/api/mmdeviceapi/ne-mmdeviceapi-erole).
 /// Console is the role used by most applications
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -128,11 +140,87 @@ impl fmt::Display for Role {
     }
 }
 
+impl TryFrom<&ERole> for Role {
+    type Error = WasapiError;
+
+    fn try_from(value: &ERole) -> Result<Self, Self::Error> {
+        match value {
+            ERole(0) => Ok(Self::Console),
+            ERole(1) => Ok(Self::Multimedia),
+            ERole(2) => Ok(Self::Communications),
+            x => Err(WasapiError::IllegalDeviceRole(x.0)),
+        }
+    }
+}
+impl TryFrom<ERole> for Role {
+    type Error = WasapiError;
+
+    fn try_from(value: ERole) -> Result<Self, Self::Error> {
+        Self::try_from(&value)
+    }
+}
+
+impl From<&Role> for ERole {
+    fn from(value: &Role) -> Self {
+        match value {
+            Role::Communications => eCommunications,
+            Role::Multimedia => eMultimedia,
+            Role::Console => eConsole,
+        }
+    }
+}
+impl From<Role> for ERole {
+    fn from(value: Role) -> Self {
+        Self::from(&value)
+    }
+}
+
+/// Helper enum for initializing an [AudioClient].
+/// There are four main modes that can be specified,
+/// corresponding to the four possible combinations of sharing mode and timing.
+/// The enum variants only expose the parameters that can be set in each mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum StreamMode {
+    /// Shared mode using polling for timing.
+    /// The parameters that can be set are the device buffer duration (in units on 100 ns)
+    /// and whether automatic format conversion should be enabled.
+    /// The audio engine decides the period, and this cannot be changed.
+    PollingShared {
+        autoconvert: bool,
+        buffer_duration_hns: i64,
+    },
+    /// Exclusive mode using polling for timing.
+    /// Both device period and buffer duration are given, in units of 100 ns.
+    PollingExclusive {
+        buffer_duration_hns: i64,
+        period_hns: i64,
+    },
+    /// Shared mode using event driven timing.
+    /// The parameters that can be set are the device buffer duration (in units on 100 ns)
+    /// and whether automatic format conversion should be enabled.
+    /// The audio engine decides the period, and this cannot be changed.
+    EventsShared {
+        autoconvert: bool,
+        buffer_duration_hns: i64,
+    },
+    /// Exclusive mode using event driven timing.
+    /// The period and buffer duration must be set to the same value.
+    /// Only device period is given here, in units of 100 ns.
+    EventsExclusive { period_hns: i64 },
+}
+
 /// Sharemode for device
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ShareMode {
     Shared,
     Exclusive,
+}
+
+/// Timing mode for device
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TimingMode {
+    Polling,
+    Events,
 }
 
 impl fmt::Display for ShareMode {
@@ -233,16 +321,8 @@ pub fn get_default_device(direction: &Direction) -> WasapiRes<Device> {
 
 /// Get the default playback or capture device for a specific role
 pub fn get_default_device_for_role(direction: &Direction, role: &Role) -> WasapiRes<Device> {
-    let dir = match direction {
-        Direction::Capture => eCapture,
-        Direction::Render => eRender,
-    };
-
-    let e_role = match role {
-        Role::Console => eConsole,
-        Role::Multimedia => eMultimedia,
-        Role::Communications => eCommunications,
-    };
+    let dir = direction.into();
+    let e_role = role.into();
 
     let enumerator: IMMDeviceEnumerator =
         unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
@@ -271,10 +351,7 @@ pub struct DeviceCollection {
 impl DeviceCollection {
     /// Get an [IMMDeviceCollection] of all active playback or capture devices
     pub fn new(direction: &Direction) -> WasapiRes<DeviceCollection> {
-        let dir = match direction {
-            Direction::Capture => eCapture,
-            Direction::Render => eRender,
-        };
+        let dir: EDataFlow = direction.into();
         let enumerator: IMMDeviceEnumerator =
             unsafe { CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)? };
         let devs = unsafe { enumerator.EnumAudioEndpoints(dir, DEVICE_STATE_ACTIVE)? };
@@ -310,7 +387,7 @@ impl DeviceCollection {
                 return Ok(device);
             }
         }
-        Err(WasapiError::new(format!("Unable to find device {}", name).as_str()).into())
+        Err(WasapiError::DeviceNotFound(name.to_owned()))
     }
 
     /// Get the direction for this [DeviceCollection]
@@ -325,7 +402,7 @@ pub struct DeviceCollectionIter<'a> {
     index: u32,
 }
 
-impl<'a> Iterator for DeviceCollectionIter<'a> {
+impl Iterator for DeviceCollectionIter<'_> {
     type Item = WasapiRes<Device>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -359,6 +436,27 @@ pub struct Device {
 }
 
 impl Device {
+    /// Build a [Device] from a supplied [IMMDevice] and [Direction]
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure that the [IMMDevice]'s data flow direction
+    /// is the same as the [Direction] supplied to the function.
+    ///
+    /// Use [Device::from_immdevice], which queries the endpoint, for safe construction.
+    pub unsafe fn from_raw(device: IMMDevice, direction: Direction) -> Device {
+        Device { device, direction }
+    }
+
+    /// Attempts to build a [Device] from a supplied [IMMDevice],
+    /// querying the endpoint for its data flow direction.
+    pub fn from_immdevice(device: IMMDevice) -> WasapiRes<Device> {
+        let endpoint: IMMEndpoint = device.cast()?;
+        let direction: Direction = unsafe { endpoint.GetDataFlow()? }.try_into()?;
+
+        Ok(Device { device, direction })
+    }
+
     /// Get an [IAudioClient] from an [IMMDevice]
     pub fn get_iaudioclient(&self) -> WasapiRes<AudioClient> {
         let audio_client = unsafe { self.device.Activate::<IAudioClient>(CLSCTX_ALL, None)? };
@@ -366,25 +464,21 @@ impl Device {
             client: audio_client,
             direction: self.direction,
             sharemode: None,
+            timingmode: None,
             bytes_per_frame: None,
         })
     }
 
     /// Read state from an [IMMDevice]
     pub fn get_state(&self) -> WasapiRes<DeviceState> {
-        let mut pdwstate: u32 = 0;
-        let state = unsafe { self.device.GetState(&mut pdwstate) };
-        trace!("state: {:?}, pdwstate: {}", state, pdwstate);
-        let state_enum = match pdwstate {
-            _ if pdwstate == DEVICE_STATE_ACTIVE.0 => DeviceState::Active,
-            _ if pdwstate == DEVICE_STATE_DISABLED.0 => DeviceState::Disabled,
-            _ if pdwstate == DEVICE_STATE_NOTPRESENT.0 => DeviceState::NotPresent,
-            _ if pdwstate == DEVICE_STATE_UNPLUGGED.0 => DeviceState::Unplugged,
-            x => {
-                return Err(
-                    WasapiError::new(&format!("Got an illegal state: DEVICE_STATE({})", x)).into(),
-                )
-            }
+        let state = unsafe { self.device.GetState()? };
+        trace!("state: {:?}", state);
+        let state_enum = match state {
+            _ if state == DEVICE_STATE_ACTIVE => DeviceState::Active,
+            _ if state == DEVICE_STATE_DISABLED => DeviceState::Disabled,
+            _ if state == DEVICE_STATE_NOTPRESENT => DeviceState::NotPresent,
+            _ if state == DEVICE_STATE_UNPLUGGED => DeviceState::Unplugged,
+            x => return Err(WasapiError::IllegalDeviceState(x.0)),
         };
         Ok(state_enum)
     }
@@ -439,10 +533,10 @@ impl Handler {
     }
 }
 
-impl IActivateAudioInterfaceCompletionHandler_Impl for Handler {
+impl IActivateAudioInterfaceCompletionHandler_Impl for Handler_Impl {
     fn ActivateCompleted(
         &self,
-        _activateoperation: Option<&IActivateAudioInterfaceAsyncOperation>,
+        _activateoperation: Ref<IActivateAudioInterfaceAsyncOperation>,
     ) -> windows::core::Result<()> {
         let (lock, cvar) = &*self.0;
         let mut completed = lock.lock().unwrap();
@@ -458,6 +552,7 @@ pub struct AudioClient {
     client: IAudioClient,
     direction: Direction,
     sharemode: Option<ShareMode>,
+    timingmode: Option<TimingMode>,
     bytes_per_frame: Option<usize>,
 }
 
@@ -465,39 +560,50 @@ impl AudioClient {
     /// Creates a loopback capture [AudioClient] for a specific process.
     ///
     /// `include_tree` is equivalent to [PROCESS_LOOPBACK_MODE](https://learn.microsoft.com/en-us/windows/win32/api/audioclientactivationparams/ne-audioclientactivationparams-process_loopback_mode).
-    /// If true, the loopback capture client will capture audio from the target process and all its child processes, if false only audio from the target process is captured.
+    /// If true, the loopback capture client will capture audio from the target process and all its child processes,
+    /// if false only audio from the target process is captured.
     ///
-    /// On versions of Windows prior to Windows 10, the thread calling this function must called in a COM Single-Threaded Apartment (STA).
+    /// On versions of Windows prior to Windows 10, the thread calling this function
+    /// must called in a COM Single-Threaded Apartment (STA).
     ///
-    /// Additionally when calling [AudioClient::initialize_client] on the client returned by this method, the caller must use [Direction::Capture], and [ShareMode::Shared].
-    /// Finally calls to [AudioClient::get_periods] do not work, however the period passed by the caller to [AudioClient::initialize_client] is irrelevant.
+    /// Additionally when calling [AudioClient::initialize_client] on the client returned by this method,
+    /// the caller must use [Direction::Capture], and [ShareMode::Shared].
+    /// Finally calls to [AudioClient::get_device_period] do not work,
+    /// however the period passed by the caller to [AudioClient::initialize_client] is irrelevant.
     ///
-    /// # Non-functional methods:
-    /// * `get_mixformat` just returns `Not implemented`
-    /// * `is_supported` just returns `Not implemented` even if the format and mode work
-    /// * `is_supported_exclusive_with_quirks` just returns `Unable to find a supported format`
-    /// * `get_periods` just returns `Not implemented`
+    /// # Non-functional methods
+    /// In process loopback mode, the functionality of the AudioClient is limited.
+    /// The following methods either do not work, or return incorrect results:
+    /// * `get_mixformat` just returns `Not implemented`.
+    /// * `is_supported` just returns `Not implemented` even if the format and mode work.
+    /// * `is_supported_exclusive_with_quirks` just returns `Unable to find a supported format`.
+    /// * `get_device_period` just returns `Not implemented`.
     /// * `calculate_aligned_period_near` just returns `Not implemented` even for values that would later work.
-    /// * `get_bufferframecount` returns huge values like 3131961357 but no error
-    /// * `get_current_padding` just returns Not `implemented`
+    /// * `get_buffer_size` returns huge values like 3131961357 but no error.
+    /// * `get_current_padding` just returns `Not implemented`.
     /// * `get_available_space_in_frames` just returns `Client has not been initialised` even if it has.
-    /// * `get_audiorenderclient` just returns `No such interface supported`
-    /// * `get_audiosessioncontrol` just returns `No such interface supported`
-    /// * `get_audioclock` just returns `No such interface supported`
-    /// * `get_sharemode` slways returns `None` when it should returns Shared after initialisation
+    /// * `get_audiorenderclient` just returns `No such interface supported`.
+    /// * `get_audiosessioncontrol` just returns `No such interface supported`.
+    /// * `get_audioclock` just returns `No such interface supported`.
+    /// * `get_sharemode` always returns `None` when it should return `Shared` after initialisation.
     ///
     /// # Example
     /// ```
-    /// use wasapi::{WaveFormat, SampleType, ProcessAudioClient, initialize_mta};
+    /// use wasapi::{WaveFormat, SampleType, AudioClient, Direction, StreamMode, initialize_mta};
     /// let desired_format = WaveFormat::new(32, 32, &SampleType::Float, 44100, 2, None);
-    /// let hnsbufferduration = 200_000; // 20ms in hundreds of nanoseconds
+    /// let buffer_duration_hns = 200_000; // 20ms in hundreds of nanoseconds
     /// let autoconvert = true;
     /// let include_tree = false;
     /// let process_id = std::process::id();
     ///
     /// initialize_mta().ok().unwrap(); // Don't do this on a UI thread
-    /// let mut audio_client = ProcessAudioClient::new(process_id, include_tree).unwrap();
-    /// audio_client.initialize_client(&desired_format, hnsbufferduration, autoconvert).unwrap();
+    /// let mut audio_client = AudioClient::new_application_loopback_client(process_id, include_tree).unwrap();
+    /// let mode = StreamMode::EventsShared { autoconvert, buffer_duration_hns };
+    /// audio_client.initialize_client(
+    ///     &desired_format,
+    ///     &Direction::Capture,
+    ///     &mode
+    /// ).unwrap();
     /// ```
     pub fn new_application_loopback_client(process_id: u32, include_tree: bool) -> WasapiRes<Self> {
         unsafe {
@@ -517,24 +623,24 @@ impl AudioClient {
             };
             let pinned_params = Pin::new(&mut audio_client_activation_params);
 
-            let raw_prop = windows_core::imp::PROPVARIANT {
-                Anonymous: windows_core::imp::PROPVARIANT_0 {
-                    Anonymous: windows_core::imp::PROPVARIANT_0_0 {
-                        vt: VT_BLOB.0,
+            let raw_prop = PROPVARIANT {
+                Anonymous: PROPVARIANT_0 {
+                    Anonymous: ManuallyDrop::new(PROPVARIANT_0_0 {
+                        vt: VT_BLOB,
                         wReserved1: 0,
                         wReserved2: 0,
                         wReserved3: 0,
-                        Anonymous: windows_core::imp::PROPVARIANT_0_0_0 {
-                            blob: windows_core::imp::BLOB {
+                        Anonymous: PROPVARIANT_0_0_0 {
+                            blob: BLOB {
                                 cbSize: size_of::<AUDIOCLIENT_ACTIVATION_PARAMS>() as u32,
                                 pBlobData: pinned_params.get_mut() as *const _ as *mut _,
                             },
                         },
-                    },
+                    }),
                 },
             };
 
-            let activation_prop = ManuallyDrop::new(PROPVARIANT::from_raw(raw_prop));
+            let activation_prop = ManuallyDrop::new(raw_prop);
             let pinned_prop = Pin::new(activation_prop.deref());
             let activation_params = Some(pinned_prop.get_ref() as *const _);
 
@@ -566,12 +672,14 @@ impl AudioClient {
 
             // Ensure successful activation
             result.ok()?;
-            let audio_client: IAudioClient = audio_client.unwrap().cast()?; // always safe to unwrap if result above is checked first
+            // always safe to unwrap if result above is checked first
+            let audio_client: IAudioClient = audio_client.unwrap().cast()?;
 
             Ok(AudioClient {
                 client: audio_client,
                 direction: Direction::Render,
                 sharemode: Some(ShareMode::Shared),
+                timingmode: None,
                 bytes_per_frame: None,
             })
         }
@@ -716,11 +824,11 @@ impl AudioClient {
                 return Ok(wave_fmt);
             }
         }
-        Err(WasapiError::new("Unable to find a supported format").into())
+        Err(WasapiError::UnsupportedFormat)
     }
 
     /// Get default and minimum periods in 100-nanosecond units
-    pub fn get_periods(&self) -> WasapiRes<(i64, i64)> {
+    pub fn get_device_period(&self) -> WasapiRes<(i64, i64)> {
         let mut def_time = 0;
         let mut min_time = 0;
         unsafe {
@@ -729,6 +837,14 @@ impl AudioClient {
         };
         trace!("default period {}, min period {}", def_time, min_time);
         Ok((def_time, min_time))
+    }
+
+    #[deprecated(
+        since = "0.17.0",
+        note = "please use the new function name `get_device_period` instead"
+    )]
+    pub fn get_periods(&self) -> WasapiRes<(i64, i64)> {
+        self.get_device_period()
     }
 
     /// Helper function for calculating a period size in 100-nanosecond units that is near a desired value,
@@ -746,7 +862,7 @@ impl AudioClient {
         align_bytes: Option<u32>,
         wave_fmt: &WaveFormat,
     ) -> WasapiRes<i64> {
-        let (_default_period, min_period) = self.get_periods()?;
+        let (_default_period, min_period) = self.get_device_period()?;
         let adjusted_desired_period = cmp::max(desired_period, min_period);
         let frame_bytes = wave_fmt.get_blockalign();
         let period_alignment_bytes = match align_bytes {
@@ -772,76 +888,154 @@ impl AudioClient {
         Ok(aligned_period)
     }
 
-    /// Initialize an [IAudioClient] for the given direction, sharemode and format.
-    /// Setting `convert` to true enables automatic samplerate and format conversion, meaning that almost any format will be accepted.
+    /// Initialize an [AudioClient] for the given direction, sharemode, timing mode and format.
+    /// This method wraps [IAudioClient::Initialize()](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-initialize).
+    ///
+    /// ### Sharing mode
+    /// In WASAPI, sharing mode determines how multiple audio applications interact with the same audio endpoint.
+    /// There are two primary sharing modes: Shared and Exclusive.
+    /// #### Shared Mode ([ShareMode::Shared])
+    /// - Multiple applications can simultaneously access the audio device.
+    /// - The system's audio engine mixes the audio streams from all applications.
+    /// - The application has no control over the sample rate and format used by the device.
+    /// - The audio engine can perform automatic sample rate and format conversion,
+    ///   meaning that almost any format can be accepted.
+    ///
+    /// #### Exclusive Mode ([ShareMode::Exclusive])
+    /// - Only one application can access the audio device at a time.
+    /// - This mode provides lower latency but requires the device to support the exact audio format requested.
+    /// - The application can control the sample rate and format used by the device.
+    ///
+    /// ### Timing mode
+    /// Event-driven mode and polling mode are two different ways of handling audio buffer updates.
+    ///
+    /// #### Event-Driven Mode ([TimingMode::Events])
+    ///   - In this mode, the application registers an event handle using [AudioClient::set_get_eventhandle()].
+    ///   - The system signals this event whenever a new buffer of audio data is ready to be processed (either for rendering or capture).
+    ///   - The application's audio processing thread waits on this event ([Handle::wait_for_event()]).
+    ///   - When the event is signaled, the thread wakes up to processes the available data, and then goes back to waiting.
+    ///   - This mode is generally more efficient because the application only wakes up when there's work to do.
+    ///   - It's suitable for real-time audio applications where low latency is important.
+    ///   - This mode is not supported by all devices in exclusive mode (but all devices are supported in shared mode).
+    ///   - In exclusive mode, devices using the standard Windows USB audio driver can have issues
+    ///     with stuttering sound on playback.
+    ///
+    /// #### Polling Mode ([TimingMode::Polling])
+    ///   - In this mode, the application periodically calls [AudioClient::get_current_padding()] (for capture)
+    ///     or [AudioClient::get_available_space_in_frames()] (for playback)
+    ///     to check how much data is available or required.
+    ///   - The thread processes the data, and then goes to sleep, for example by calling [std::thread::sleep()].
+    ///   - This mode is less efficient and is more prone to glitches when running at low latency.
+    ///   - In exclusive mode, it supports more devices, and does not have the stuttering issue with USB audio devices.
     pub fn initialize_client(
         &mut self,
         wavefmt: &WaveFormat,
-        period: i64,
         direction: &Direction,
-        sharemode: &ShareMode,
-        convert: bool,
+        stream_mode: &StreamMode,
     ) -> WasapiRes<()> {
-        if sharemode == &ShareMode::Exclusive && convert {
-            return Err(
-                WasapiError::new("Cant use automatic format conversion in exclusive mode").into(),
-            );
-        }
+        let sharemode = match stream_mode {
+            StreamMode::PollingShared { .. } | StreamMode::EventsShared { .. } => ShareMode::Shared,
+            StreamMode::PollingExclusive { .. } | StreamMode::EventsExclusive { .. } => {
+                ShareMode::Exclusive
+            }
+        };
+        let timing = match stream_mode {
+            StreamMode::PollingShared { .. } | StreamMode::PollingExclusive { .. } => {
+                TimingMode::Polling
+            }
+            StreamMode::EventsShared { .. } | StreamMode::EventsExclusive { .. } => {
+                TimingMode::Events
+            }
+        };
         let mut streamflags = match (&self.direction, direction, sharemode) {
             (Direction::Render, Direction::Capture, ShareMode::Shared) => {
-                AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_LOOPBACK
+                AUDCLNT_STREAMFLAGS_LOOPBACK
             }
             (Direction::Render, Direction::Capture, ShareMode::Exclusive) => {
-                return Err(WasapiError::new("Cant use Loopback with exclusive mode").into());
+                return Err(WasapiError::LoopbackWithExclusiveMode);
             }
             (Direction::Capture, Direction::Render, _) => {
-                return Err(WasapiError::new("Cant render to a capture device").into());
+                return Err(WasapiError::RenderToCaptureDevice);
             }
-            _ => AUDCLNT_STREAMFLAGS_EVENTCALLBACK,
+            _ => 0,
         };
-        if convert {
-            streamflags |=
-                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+        match stream_mode {
+            StreamMode::PollingShared { autoconvert, .. }
+            | StreamMode::EventsShared { autoconvert, .. } => {
+                if *autoconvert {
+                    streamflags |= AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM
+                        | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+                }
+            }
+            _ => {}
+        }
+        if timing == TimingMode::Events {
+            streamflags |= AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
         }
         let mode = match sharemode {
             ShareMode::Exclusive => AUDCLNT_SHAREMODE_EXCLUSIVE,
             ShareMode::Shared => AUDCLNT_SHAREMODE_SHARED,
         };
-        let device_period = match sharemode {
-            ShareMode::Exclusive => period,
-            ShareMode::Shared => 0,
+        let (period, buffer_duration) = match stream_mode {
+            StreamMode::PollingShared {
+                buffer_duration_hns,
+                ..
+            } => (0, *buffer_duration_hns),
+            StreamMode::EventsShared {
+                buffer_duration_hns,
+                ..
+            } => (0, *buffer_duration_hns),
+            StreamMode::PollingExclusive {
+                period_hns,
+                buffer_duration_hns,
+            } => (*period_hns, *buffer_duration_hns),
+            StreamMode::EventsExclusive { period_hns, .. } => (*period_hns, *period_hns),
         };
-        self.sharemode = Some(*sharemode);
         unsafe {
             self.client.Initialize(
                 mode,
                 streamflags,
+                buffer_duration,
                 period,
-                device_period,
                 wavefmt.as_waveformatex_ref(),
                 None,
             )?;
         }
+        self.direction = *direction;
+        self.sharemode = Some(sharemode);
+        self.timingmode = Some(timing);
         self.bytes_per_frame = Some(wavefmt.get_blockalign() as usize);
         Ok(())
     }
 
-    /// Create and return an event handle for an [IAudioClient]
+    /// Create and return an event handle for an [AudioClient].
+    /// This is required when using an [AudioClient] initialized for event driven mode, [TimingMode::Events].
     pub fn set_get_eventhandle(&self) -> WasapiRes<Handle> {
         let h_event = unsafe { CreateEventA(None, false, false, PCSTR::null())? };
         unsafe { self.client.SetEventHandle(h_event)? };
         Ok(Handle { handle: h_event })
     }
 
-    /// Get buffer size in frames
-    pub fn get_bufferframecount(&self) -> WasapiRes<u32> {
+    /// Get buffer size in frames,
+    /// see [IAudioClient::GetBufferSize](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-getbuffersize).
+    pub fn get_buffer_size(&self) -> WasapiRes<u32> {
         let buffer_frame_count = unsafe { self.client.GetBufferSize()? };
         trace!("buffer_frame_count {}", buffer_frame_count);
         Ok(buffer_frame_count)
     }
 
+    #[deprecated(
+        since = "0.17.0",
+        note = "please use the new function name `get_buffer_size` instead"
+    )]
+    pub fn get_bufferframecount(&self) -> WasapiRes<u32> {
+        self.get_buffer_size()
+    }
+
     /// Get current padding in frames.
     /// This represents the number of frames currently in the buffer, for both capture and render devices.
+    /// The exact meaning depends on how the AudioClient was initialized, see
+    /// [IAudioClient::GetCurrentPadding](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudioclient-getcurrentpadding).
     pub fn get_current_padding(&self) -> WasapiRes<u32> {
         let padding_count = unsafe { self.client.GetCurrentPadding()? };
         trace!("padding_count {}", padding_count);
@@ -851,19 +1045,19 @@ impl AudioClient {
     /// Get buffer size minus padding in frames.
     /// Use this to find out how much free space is available in the buffer.
     pub fn get_available_space_in_frames(&self) -> WasapiRes<u32> {
-        let frames = match self.sharemode {
-            Some(ShareMode::Exclusive) => {
+        let frames = match (self.sharemode, self.timingmode) {
+            (Some(ShareMode::Exclusive), Some(TimingMode::Events)) => {
                 let buffer_frame_count = unsafe { self.client.GetBufferSize()? };
                 trace!("buffer_frame_count {}", buffer_frame_count);
                 buffer_frame_count
             }
-            Some(ShareMode::Shared) => {
+            (Some(_), Some(_)) => {
                 let padding_count = unsafe { self.client.GetCurrentPadding()? };
                 let buffer_frame_count = unsafe { self.client.GetBufferSize()? };
 
                 buffer_frame_count - padding_count
             }
-            _ => return Err(WasapiError::new("Client has not been initialized").into()),
+            _ => return Err(WasapiError::ClientNotInit),
         };
         Ok(frames)
     }
@@ -928,6 +1122,14 @@ impl AudioClient {
         self.sharemode
     }
 
+    /// Get the timing mode for this [AudioClient].
+    /// The mode is decided when the client is initialized.
+    pub fn get_timing_mode(&self) -> Option<TimingMode> {
+        self.timingmode
+    }
+
+    /// Get the Acoustic Echo Cancellation Control.
+    /// If it succeeds, the capture endpoint supports control of the loopback reference endpoint for AEC.
     pub fn get_aec_control(&self) -> WasapiRes<AcousticEchoCancellationControl> {
         let control = unsafe {
             self.client
@@ -936,11 +1138,13 @@ impl AudioClient {
         Ok(AcousticEchoCancellationControl { control })
     }
 
+    /// Get the Audio Effects Manager.
     pub fn get_audio_effects_manager(&self) -> WasapiRes<AudioEffectsManager> {
         let manager = unsafe { self.client.GetService::<IAudioEffectsManager>()? };
         Ok(AudioEffectsManager { manager })
     }
 
+    /// Set the category of an audio stream.
     pub fn set_audio_stream_category(&self, category: AUDIO_STREAM_CATEGORY) -> WasapiRes<()> {
         let audio_client_2 = self.client.cast::<IAudioClient2>()?;
 
@@ -952,6 +1156,41 @@ impl AudioClient {
 
         unsafe { audio_client_2.SetClientProperties(&audio_client_property as *const _)? };
         Ok(())
+    }
+
+    /// Check if the Acoustic Echo Cancellation (AEC) is supported.
+    pub fn is_aec_supported(&self) -> WasapiRes<bool> {
+        if !self.is_aec_effect_present()? {
+            return Ok(false);
+        }
+
+        match unsafe { self.client.GetService::<IAcousticEchoCancellationControl>() } {
+            Ok(_) => Ok(true),
+            Err(err) if err == E_NOINTERFACE.into() => Ok(false),
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    fn is_aec_effect_present(&self) -> WasapiRes<bool> {
+        // IAudioEffectsManager requires Windows 11 (build 22000 or higher).
+        let audio_effects_manager = match self.get_audio_effects_manager() {
+            Ok(manager) => manager,
+            Err(WasapiError::Windows(win_err)) if win_err == E_NOINTERFACE.into() => {
+                // Audio effects manager is not supported, so clearly not present.
+                return Ok(false);
+            }
+            Err(err) => return Err(err),
+        };
+
+        if let Some(audio_effects) = audio_effects_manager.get_audio_effects()? {
+            // Check if the AEC effect is present in the list of audio effects.
+            let is_present = audio_effects
+                .iter()
+                .any(|effect| effect.id == AUDIO_EFFECT_TYPE_ACOUSTIC_ECHO_CANCELLATION);
+            return Ok(is_present);
+        }
+
+        Ok(false)
     }
 }
 
@@ -969,69 +1208,46 @@ impl AudioSessionControl {
             _ if state == AudioSessionStateActive => SessionState::Active,
             _ if state == AudioSessionStateInactive => SessionState::Inactive,
             _ if state == AudioSessionStateExpired => SessionState::Expired,
-            x => {
-                return Err(
-                    WasapiError::new(&format!("Got an illegal session state {:?}", x)).into(),
-                );
-            }
+            x => return Err(WasapiError::IllegalSessionState(x.0)),
         };
         Ok(sessionstate)
     }
 
-    /// Register to receive notifications
-    pub fn register_session_notification(&self, callbacks: Weak<EventCallbacks>) -> WasapiRes<()> {
+    /// Register to receive notifications.
+    /// Returns a [EventRegistration] struct.
+    /// The notifications are unregistered when this struct is dropped.
+    /// Make sure to store the [EventRegistration] in a variable that remains
+    /// in scope for as long as the event notifications are needed.
+    ///
+    /// The function takes ownership of the provided [EventCallbacks].
+    pub fn register_session_notification(
+        &self,
+        callbacks: EventCallbacks,
+    ) -> WasapiRes<EventRegistration> {
         let events: IAudioSessionEvents = AudioSessionEvents::new(callbacks).into();
 
         match unsafe { self.control.RegisterAudioSessionNotification(&events) } {
-            Ok(()) => Ok(()),
-            Err(err) => {
-                Err(WasapiError::new(&format!("Failed to register notifications, {}", err)).into())
-            }
+            Ok(()) => Ok(EventRegistration {
+                events,
+                control: self.control.clone(),
+            }),
+            Err(err) => Err(WasapiError::RegisterNotifications(err)),
         }
     }
 }
 
-// Struct wrapping an [IAudioEffectsManager](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iaudioeffectsmanager).
-pub struct AudioEffectsManager {
-    manager: IAudioEffectsManager,
+/// Struct for keeping track of the registered notifications.
+pub struct EventRegistration {
+    events: IAudioSessionEvents,
+    control: IAudioSessionControl,
 }
 
-impl AudioEffectsManager {
-    pub fn get_audio_effects(&self) -> WasapiRes<Option<Vec<AUDIO_EFFECT>>> {
-        let mut audio_effects: *mut AUDIO_EFFECT = std::ptr::null_mut();
-        let mut num_effects: u32 = 0;
-
-        unsafe {
-            self.manager
-                .GetAudioEffects(&mut audio_effects, &mut num_effects)?;
-        }
-
-        // Assuming you want to return the first effect or handle it in some way
-        if num_effects > 0 {
-            let effects_slice =
-                unsafe { std::slice::from_raw_parts(audio_effects, num_effects as usize) };
-            let effects_vec = effects_slice.to_vec();
-            Ok(Some(effects_vec))
-        } else {
-            Ok(None)
-        }
-    }
-}
-
-/// Struct wrapping an [AcousticEchoCancellationControl](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iacousticechocancellationcontrol).
-pub struct AcousticEchoCancellationControl {
-    control: IAcousticEchoCancellationControl,
-}
-
-impl AcousticEchoCancellationControl {
-    /// Sets the audio render endpoint that should be used as the reference stream for acoustic echo cancellation (AEC).
-    pub fn set_echo_cancellation_render_endpoint(&self, endpoint_id: String) -> WasapiRes<()> {
-        let endpoint_id = HSTRING::from(endpoint_id);
-        unsafe {
+impl Drop for EventRegistration {
+    fn drop(&mut self) {
+        let _ = unsafe {
             self.control
-                .SetEchoCancellationRenderEndpoint(&endpoint_id)?
+                .UnregisterAudioSessionNotification(&self.events)
         };
-        Ok(())
     }
 }
 
@@ -1082,15 +1298,10 @@ impl AudioRenderClient {
         }
         let nbr_bytes = nbr_frames * self.bytes_per_frame;
         if nbr_bytes != data.len() {
-            return Err(WasapiError::new(
-                format!(
-                    "Wrong length of data, got {}, expected {}",
-                    data.len(),
-                    nbr_bytes
-                )
-                .as_str(),
-            )
-            .into());
+            return Err(WasapiError::DataLengthMismatch {
+                received: data.len(),
+                expected: nbr_bytes,
+            });
         }
         let bufferptr = unsafe { self.client.GetBuffer(nbr_frames as u32)? };
         let bufferslice = unsafe { slice::from_raw_parts_mut(bufferptr, nbr_bytes) };
@@ -1119,10 +1330,10 @@ impl AudioRenderClient {
         }
         let nbr_bytes = nbr_frames * self.bytes_per_frame;
         if nbr_bytes > data.len() {
-            return Err(WasapiError::new(
-                format!("To little data, got {}, need {}", data.len(), nbr_bytes).as_str(),
-            )
-            .into());
+            return Err(WasapiError::DataLengthTooShort {
+                received: data.len(),
+                expected: nbr_bytes,
+            });
         }
         let bufferptr = unsafe { self.client.GetBuffer(nbr_frames as u32)? };
         let bufferslice = unsafe { slice::from_raw_parts_mut(bufferptr, nbr_bytes) };
@@ -1193,13 +1404,22 @@ pub struct AudioCaptureClient {
 
 impl AudioCaptureClient {
     /// Get number of frames in next packet when in shared mode.
-    /// In exclusive mode it returns None, instead use [AudioClient::get_bufferframecount()].
-    pub fn get_next_nbr_frames(&self) -> WasapiRes<Option<u32>> {
+    /// In exclusive mode it returns None, instead use [AudioClient::get_buffer_size()] or [AudioClient::get_current_padding()].
+    /// See [IAudioCaptureClient::GetNextPacketSize](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nf-audioclient-iaudiocaptureclient-getnextpacketsize).
+    pub fn get_next_packet_size(&self) -> WasapiRes<Option<u32>> {
         if let Some(ShareMode::Exclusive) = self.sharemode {
             return Ok(None);
         }
         let nbr_frames = unsafe { self.client.GetNextPacketSize()? };
         Ok(Some(nbr_frames))
+    }
+
+    #[deprecated(
+        since = "0.17.0",
+        note = "please use the new function name `get_next_packet_size` instead"
+    )]
+    pub fn get_next_nbr_frames(&self) -> WasapiRes<Option<u32>> {
+        self.get_next_packet_size()
     }
 
     /// Read raw bytes from a device into a slice. Returns the number of frames
@@ -1230,14 +1450,10 @@ impl AudioCaptureClient {
         }
         if data_len_in_frames < nbr_frames_returned as usize {
             unsafe { self.client.ReleaseBuffer(nbr_frames_returned)? };
-            return Err(WasapiError::new(
-                format!(
-                    "Wrong length of data, got {} frames, expected at least {} frames",
-                    data_len_in_frames, nbr_frames_returned
-                )
-                .as_str(),
-            )
-            .into());
+            return Err(WasapiError::DataLengthTooShort {
+                received: data_len_in_frames,
+                expected: nbr_frames_returned as usize,
+            });
         }
         let len_in_bytes = nbr_frames_returned as usize * self.bytes_per_frame;
         let bufferslice = unsafe { slice::from_raw_parts(buffer_ptr, len_in_bytes) };
@@ -1298,8 +1514,69 @@ impl Handle {
     pub fn wait_for_event(&self, timeout_ms: u32) -> WasapiRes<()> {
         let retval = unsafe { WaitForSingleObject(self.handle, timeout_ms) };
         if retval.0 != WAIT_OBJECT_0.0 {
-            return Err(WasapiError::new("Wait timed out").into());
+            return Err(WasapiError::EventTimeout);
         }
+        Ok(())
+    }
+}
+
+// Struct wrapping an [IAudioEffectsManager](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iaudioeffectsmanager).
+pub struct AudioEffectsManager {
+    manager: IAudioEffectsManager,
+}
+
+impl AudioEffectsManager {
+    /// Gets the current list of audio effects for the associated audio stream.
+    pub fn get_audio_effects(&self) -> WasapiRes<Option<Vec<AUDIO_EFFECT>>> {
+        let mut audio_effects: *mut AUDIO_EFFECT = std::ptr::null_mut();
+        let mut num_effects: u32 = 0;
+
+        unsafe {
+            self.manager
+                .GetAudioEffects(&mut audio_effects, &mut num_effects)?;
+        }
+
+        if num_effects > 0 {
+            let effects_slice =
+                unsafe { slice::from_raw_parts(audio_effects, num_effects as usize) };
+            let effects_vec = effects_slice.to_vec();
+            // Free the memory allocated for the audio effects.
+            unsafe { CoTaskMemFree(Some(audio_effects as *mut _)) };
+            Ok(Some(effects_vec))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Struct wrapping an [AcousticEchoCancellationControl](https://learn.microsoft.com/en-us/windows/win32/api/audioclient/nn-audioclient-iacousticechocancellationcontrol).
+pub struct AcousticEchoCancellationControl {
+    control: IAcousticEchoCancellationControl,
+}
+
+impl AcousticEchoCancellationControl {
+    /// Sets the audio render endpoint to be used as the reference stream for acoustic echo cancellation (AEC).
+    ///
+    /// # Parameters
+    /// - `endpoint_id`: An optional string containing the device ID of the audio render endpoint to use as the loopback reference.
+    ///   If set to `None`, Windows will automatically select the reference device.
+    ///   You can obtain the device ID by calling [`Device::get_id`].
+    ///
+    /// # Errors
+    /// Returns an error if setting the echo cancellation render endpoint fails.
+    pub fn set_echo_cancellation_render_endpoint(
+        &self,
+        endpoint_id: Option<String>,
+    ) -> WasapiRes<()> {
+        let endpoint_id = if let Some(endpoint_id) = endpoint_id {
+            PCWSTR::from_raw(HSTRING::from(endpoint_id).as_ptr())
+        } else {
+            PCWSTR::null()
+        };
+        unsafe {
+            self.control
+                .SetEchoCancellationRenderEndpoint(endpoint_id)?
+        };
         Ok(())
     }
 }

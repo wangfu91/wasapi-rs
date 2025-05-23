@@ -1,5 +1,4 @@
 use std::f64::consts::PI;
-use std::rc::Rc;
 use wasapi::*;
 
 #[macro_use]
@@ -57,17 +56,14 @@ fn main() {
     let blockalign = desired_format.get_blockalign();
     debug!("Desired playback format: {:?}", desired_format);
 
-    let (def_time, min_time) = audio_client.get_periods().unwrap();
+    let (def_time, min_time) = audio_client.get_device_period().unwrap();
     debug!("default period {}, min period {}", def_time, min_time);
-
+    let mode = StreamMode::EventsShared {
+        autoconvert: true,
+        buffer_duration_hns: def_time,
+    };
     audio_client
-        .initialize_client(
-            &desired_format,
-            def_time,
-            &Direction::Render,
-            &ShareMode::Shared,
-            true,
-        )
+        .initialize_client(&desired_format, &Direction::Render, &mode)
         .unwrap();
     debug!("initialized playback");
 
@@ -86,14 +82,10 @@ fn main() {
     });
     callbacks.set_disconnected_callback(|reason| println!("Disconnected, reason: {:?}", reason));
 
-    let callbacks_rc = Rc::new(callbacks);
-    let callbacks_weak = Rc::downgrade(&callbacks_rc);
-
     let sessioncontrol = audio_client.get_audiosessioncontrol().unwrap();
-    sessioncontrol
-        .register_session_notification(callbacks_weak)
+    let _registered_events = sessioncontrol
+        .register_session_notification(callbacks)
         .unwrap();
-
     audio_client.start_stream().unwrap();
     loop {
         let buffer_frame_count = audio_client.get_available_space_in_frames().unwrap();

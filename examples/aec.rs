@@ -9,16 +9,15 @@ use wasapi::*;
 #[macro_use]
 extern crate log;
 use simplelog::*;
+use windows::Win32::Media::Audio::AudioCategory_Communications;
 
 type Res<T> = Result<T, Box<dyn error::Error>>;
 
 // Capture loop, capture samples and send in chunks of "chunksize" frames to channel
 fn capture_loop(tx_capt: std::sync::mpsc::SyncSender<Vec<u8>>, chunksize: usize) -> Res<()> {
-    // Use `Direction::Capture` for normal capture,
-    // or `Direction::Render` for loopback mode (for capturing from a playback device).
-    let device = get_default_device(&Direction::Capture)?;
+    let input_device = get_default_device_for_role(&Direction::Capture, &Role::Communications)?;
 
-    let mut audio_client = device.get_iaudioclient()?;
+    let mut audio_client = input_device.get_iaudioclient()?;
 
     let desired_format = WaveFormat::new(32, 32, &SampleType::Float, 44100, 2, None);
 
@@ -28,12 +27,35 @@ fn capture_loop(tx_capt: std::sync::mpsc::SyncSender<Vec<u8>>, chunksize: usize)
     let (def_time, min_time) = audio_client.get_device_period()?;
     debug!("default period {}, min period {}", def_time, min_time);
 
+    // Set the category as communications, so that audio effects like AEC can be applied.
+    // this category is not valid for speaker loopback stream, so only set it for input capture.
+    audio_client.set_audio_stream_category(AudioCategory_Communications)?;
+
     let mode = StreamMode::EventsShared {
         autoconvert: true,
         buffer_duration_hns: min_time,
     };
     audio_client.initialize_client(&desired_format, &Direction::Capture, &mode)?;
     debug!("initialized capture");
+
+    // Enable Acoustic Echo Cancellation if it is supported.
+    if audio_client.is_aec_supported()? {
+        let aec_ctrl = audio_client.get_aec_control()?;
+
+        let output_device = get_default_device(&Direction::Render)?;
+        let render_endpoint_id = output_device.get_id()?;
+        // Pass the endpoint id of the audio render endpoint that should be used as the reference stream for AEC.
+        aec_ctrl.set_echo_cancellation_render_endpoint(Some(render_endpoint_id))?;
+        debug!(
+            "AEC enabled with render endpoint: {}",
+            output_device.get_interface_friendlyname()?
+        );
+    } else {
+        warn!(
+            "AEC not supported on input device: {}",
+            input_device.get_interface_friendlyname()?
+        );
+    }
 
     let h_event = audio_client.set_get_eventhandle()?;
 
@@ -98,8 +120,8 @@ fn main() -> Res<()> {
             }
         });
 
-    let mut outfile = File::create("recorded.raw")?;
-    info!("Saving captured raw data to 'recorded.raw'");
+    let mut outfile = File::create("aec-recorded.raw")?;
+    info!("Saving captured raw data to 'aec-recorded.raw'");
 
     loop {
         match rx_capt.recv() {

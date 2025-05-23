@@ -1,4 +1,5 @@
 use rand::prelude::*;
+use std::{thread, time};
 use wasapi::*;
 
 #[macro_use]
@@ -43,17 +44,20 @@ fn main() {
 
     // Set some period as an example, using 128 byte alignment to satisfy for example Intel HDA devices.
     let desired_period = audio_client
-        .calculate_aligned_period_near(3 * min_period / 2, Some(128), &desired_format)
+        .calculate_aligned_period_near(def_period, Some(128), &desired_format)
         .unwrap();
 
     debug!(
-        "periods in 100ns units {}, minimum {}, wanted {}",
+        "periods in 100ns units, default: {}, minimum: {}, wanted: {}",
         def_period, min_period, desired_period
     );
-
-    let mode = StreamMode::EventsExclusive {
+    // Allocate a buffer with space for several periods.
+    // This means we have plenty of time to refill before getting an underrun.
+    let mode = StreamMode::PollingExclusive {
         period_hns: desired_period,
+        buffer_duration_hns: 16 * desired_period,
     };
+
     let init_result = audio_client.initialize_client(&desired_format, &Direction::Render, &mode);
     match init_result {
         Ok(()) => debug!("IAudioClient::Initialize ok"),
@@ -84,6 +88,11 @@ fn main() {
                         // 4. Get a new IAudioClient
                         audio_client = device.get_iaudioclient().unwrap();
                         // 5. Call Initialize again on the created audio client.
+                        let mode = StreamMode::PollingExclusive {
+                            period_hns: aligned_period,
+                            buffer_duration_hns: 16 * aligned_period,
+                        };
+
                         audio_client
                             .initialize_client(&desired_format, &Direction::Render, &mode)
                             .unwrap();
@@ -124,11 +133,22 @@ fn main() {
 
     let mut rng = rand::thread_rng();
 
-    let h_event = audio_client.set_get_eventhandle().unwrap();
-
     let render_client = audio_client.get_audiorenderclient().unwrap();
 
+    let buffer_frames = audio_client.get_buffer_size().unwrap();
+
+    // Set the sleep to half the buffer duration.
+    let sleep_period = time::Duration::from_millis(
+        500 * buffer_frames as u64 / desired_format.get_samplespersec() as u64,
+    );
+    info!(
+        "buffer frames: {}, sleep_period {} ms",
+        buffer_frames,
+        sleep_period.as_millis()
+    );
+
     audio_client.start_stream().unwrap();
+
     loop {
         let buffer_frame_count = audio_client.get_available_space_in_frames().unwrap();
 
@@ -143,15 +163,11 @@ fn main() {
             }
         }
 
-        trace!("write");
+        debug!("write {} frames", buffer_frame_count);
         render_client
             .write_to_device(buffer_frame_count as usize, &data, None)
             .unwrap();
         trace!("write ok");
-        if h_event.wait_for_event(1000).is_err() {
-            error!("error, stopping playback");
-            audio_client.stop_stream().unwrap();
-            break;
-        }
+        thread::sleep(sleep_period);
     }
 }
